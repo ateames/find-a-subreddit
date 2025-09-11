@@ -1,0 +1,139 @@
+name: findasubreddit
+
+services:
+  # =======================
+  # Backend Service (FastAPI via Dockerfile)
+  # =======================
+  - name: backend
+    source_dir: opt/findasubreddit/backend        # <-- relative, no leading slash
+    dockerfile_path: Dockerfile
+    http_port: 8080
+
+    # Health check
+    health_check:
+      http_path: /healthz
+      initial_delay_seconds: 30
+      period_seconds: 15
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 5
+
+    # This route is for the backend’s own default URL (each component has one).
+    # You’ll point your API custom domain at this component in the DO UI.
+    routes:
+      - path: /
+
+    envs:
+      # --- Required Secrets ---
+      - key: DATABASE_URL
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: OPENAI_API_KEY
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: REDDIT_CLIENT_ID
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: REDDIT_CLIENT_SECRET
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: JWT_SECRET
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+
+      # --- Reddit OAuth ---
+      - key: REDDIT_REDIRECT_URI
+        scope: RUN_AND_BUILD_TIME
+        value: "https://api.YOUR_DOMAIN/api/auth/reddit/callback"
+      - key: REDDIT_USER_AGENT
+        scope: RUN_AND_BUILD_TIME
+        value: "sub_finder_ai/0.1 by SchmeedsMcSchmeeds"
+
+      # --- Frontend / CORS / Hosts ---
+      - key: FRONTEND_ORIGIN
+        scope: RUN_AND_BUILD_TIME
+        value: "https://YOUR_DOMAIN"
+      - key: CORS_ORIGINS
+        scope: RUN_AND_BUILD_TIME
+        value: "https://YOUR_DOMAIN,https://www.YOUR_DOMAIN"
+
+      # Prefer TRUSTED_HOSTS (your API now reads this first). Include * for DO health probes.
+      - key: TRUSTED_HOSTS
+        scope: RUN_AND_BUILD_TIME
+        value: "*,YOUR_DOMAIN,api.YOUR_DOMAIN,*.ondigitalocean.app,localhost,127.0.0.1"
+
+      # --- Security & Cookie Settings ---
+      - key: COOKIE_SECURE
+        scope: RUN_AND_BUILD_TIME
+        value: "true"
+      - key: COOKIE_SAMESITE
+        scope: RUN_AND_BUILD_TIME
+        value: "lax"
+
+      # --- Logging ---
+      - key: LOG_LEVEL
+        scope: RUN_AND_BUILD_TIME
+        value: "INFO"
+
+      # --- AI Models ---
+      - key: EMBED_MODEL
+        scope: RUN_AND_BUILD_TIME
+        value: "text-embedding-3-small"
+      - key: CHAT_MODEL
+        scope: RUN_AND_BUILD_TIME
+        value: "gpt-4o-mini"
+      - key: VISION_MODEL
+        scope: RUN_AND_BUILD_TIME
+        value: "gpt-4o"
+
+      # --- Behavior Tuning ---
+      - key: PAGE_SIZE
+        scope: RUN_AND_BUILD_TIME
+        value: "8"
+      - key: MAX_CANDIDATE_SUBS
+        scope: RUN_AND_BUILD_TIME
+        value: "200"
+      - key: RULE_MATCH_THRESHOLD
+        scope: RUN_AND_BUILD_TIME
+        value: "0.55"
+      - key: MAX_RULES_PER_SUB_FOR_CHECK
+        scope: RUN_AND_BUILD_TIME
+        value: "20"
+      - key: MAX_WARNINGS_PER_SUB
+        scope: RUN_AND_BUILD_TIME
+        value: "5"
+      - key: MAX_TOTAL_RULES_TO_EMBED
+        scope: RUN_AND_BUILD_TIME
+        value: "300"
+
+      # Convenience
+      - key: PORT
+        scope: RUN_AND_BUILD_TIME
+        value: "8080"
+
+static_sites:
+  # =======================
+  # Frontend Static Site (Vite)
+  # =======================
+  - name: frontend
+    source_dir: frontend       # <-- relative, no leading slash
+    build_command: npm ci && npm run build
+    output_dir: dist
+    routes:
+      - path: /
+
+    envs:
+      # Frontend reads VITE_API_URL (not VITE_API_ORIGIN)
+      - key: VITE_API_URL
+        scope: BUILD_TIME
+        value: "https://api.YOUR_DOMAIN"
+
+      # Optional flags
+      - key: VITE_SHOW_TEST_SUB
+        scope: BUILD_TIME
+        value: "false"
+
+      # Handy for footer/status page
+      - key: VITE_BUILD_SHA
+        scope: BUILD_TIME
+        value: "${_self.COMMIT_HASH}"

@@ -1,0 +1,79 @@
+# ai_reddit_prototype/docker-compose.yml
+
+services:
+  db:
+    image: ankane/pgvector:latest # Postgres with pgvector preinstalled (multi-arch; works on Apple Silicon)
+    container_name: reddit_vibes_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: reddit_vibes
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d reddit_vibes"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # FastAPI app that serves analyze_post_api.py
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: reddit_api
+    env_file:
+      - .env
+    environment:
+      # Inside Docker, use service name "db" (NOT localhost)
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/reddit_vibes
+      FRONTEND_ORIGIN: http://localhost:5173
+      # Optional tunables (uncomment to override defaults in the API)
+      # EMBED_MODEL: text-embedding-3-small
+      # CHAT_MODEL: gpt-4o-mini
+      # VISION_MODEL: gpt-4o
+      # PAGE_SIZE: "8"
+      # MAX_CANDIDATE_SUBS: "200"
+      # RULE_MATCH_THRESHOLD: "0.55"
+      # MAX_RULES_PER_SUB_FOR_CHECK: "20"
+      # MAX_WARNINGS_PER_SUB: "5"
+      # MAX_TOTAL_RULES_TO_EMBED: "300"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      uvicorn src.api.analyze_post_api:app
+      --host 0.0.0.0 --port 8001
+      --reload --reload-dir src
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    container_name: reddit_ingest
+    # Load your existing .env; then we override DATABASE_URL for Docker networking
+    env_file:
+      - .env
+    environment:
+      # Inside Docker, use service name "db" (NOT localhost)
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/reddit_vibes
+    depends_on:
+      db:
+        condition: service_healthy
+    # Mount code for fast iteration; image already has deps installed.
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: [ "bash", "/app/scripts/entrypoint-ingest.sh" ]
+    restart: "no"
+
+volumes:
+  pgdata:

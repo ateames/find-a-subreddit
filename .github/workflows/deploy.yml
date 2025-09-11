@@ -1,0 +1,29 @@
+name: Deploy to DigitalOcean (App Platform builds images)
+
+on:
+  push:
+    branches: [ Prod ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: do-app-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to DigitalOcean App Platform
+        uses: digitalocean/app_action/deploy@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          # Defaults to .do/app.yaml; override if needed:
+          # app_spec_location: .do/app.yaml
+          print_build_logs: true
+          print_deploy_logs: true

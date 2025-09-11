@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8080
+    env_file:
+      - ./backend.env
+    expose:
+      - "8080"
+    restart: unless-stopped
+    command: >
+      gunicorn -k uvicorn.workers.UvicornWorker
+      -b 0.0.0.0:8080
+      src.api.app:app
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,16 @@
+# ai_reddit_prototype/scripts/requirements.txt
+psycopg[binary]==3.2.1
+praw==7.8.1
+asyncpraw
+python-dotenv==1.0.1
+openai==1.35.10
+httpx==0.26.0
+tiktoken==0.11.0
+fastapi
+uvicorn[standard]
+pgvector
+numpy
+pydantic
+aiofiles
+pyjwt
+python-multipart

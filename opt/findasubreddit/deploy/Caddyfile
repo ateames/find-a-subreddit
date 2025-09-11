@@ -1,0 +1,21 @@
+{
+  email admin@YOUR_DOMAIN
+  # While testing, you can uncomment staging CA to avoid rate limits:
+  # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+api.YOUR_DOMAIN {
+  encode gzip
+
+  @health path /health
+  handle @health {
+    respond "ok" 200
+  }
+
+  reverse_proxy api:8080
+
+  log {
+    output stdout
+    format console
+  }
+}

@@ -1,0 +1,19 @@
+# ai_reddit_prototype/Dockerfile.ingest
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# System deps (curl & pg client for health/wait, build tools small)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Only install Python deps first (better layer caching)
+COPY /requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy the rest of the repo (compose also mounts it at runtime for dev)
+COPY . /app
