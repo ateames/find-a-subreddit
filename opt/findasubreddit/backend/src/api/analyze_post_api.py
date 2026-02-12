@@ -45,6 +45,11 @@ VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
 PAGE_SIZE_DEFAULT = int(os.getenv("PAGE_SIZE", "8"))
 MAX_CANDIDATE_SUBS = int(os.getenv("MAX_CANDIDATE_SUBS", "200"))
 
+# Hybrid retrieval: combine lexical (FTS) + semantic (vector). Weights in [0, 1]; should sum to 1.
+HYBRID_LEXICAL_WEIGHT = float(os.getenv("HYBRID_LEXICAL_WEIGHT", "0.35"))
+HYBRID_SEMANTIC_WEIGHT = float(os.getenv("HYBRID_SEMANTIC_WEIGHT", "0.65"))
+HYBRID_CANDIDATES_PER_BRANCH = int(os.getenv("HYBRID_CANDIDATES_PER_BRANCH", "300"))  # fetch more from each branch then merge
+
 # Rule matching behavior
 RULE_MATCH_THRESHOLD = float(os.getenv("RULE_MATCH_THRESHOLD", "0.55"))  # cosine similarity threshold
 MAX_RULES_PER_SUB_FOR_CHECK = int(os.getenv("MAX_RULES_PER_SUB_FOR_CHECK", "20"))
@@ -237,6 +242,7 @@ class SubredditMatch(BaseModel):
     seriousness_score: Optional[int] = Field(None, ge=0, le=5)
     content_types_not_allowed: List[str] = []
     summary: Optional[str] = None
+    topics: List[str] = []  # topic tags from ingestion (optional, non-breaking)
 
 class AnalyzePostResponse(BaseModel):
     results: List[SubredditMatch]
@@ -293,12 +299,52 @@ def summarize_post_for_preview(title: str, body: str, context: Optional[str]) ->
         return ""
 
 # ---------------------- DB HELPERS ----------------------
-def _query_similar_subreddits(conn: psycopg.Connection, query_vec: List[float], limit: int) -> List[Dict[str, Any]]:
+def _query_lexical_candidates(
+    conn: psycopg.Connection, query_tsquery: str, limit: int
+) -> List[Dict[str, Any]]:
     """
-    Get candidate subreddits by vector similarity.
-    Uses cosine distance; similarity = 1 - distance.
+    Get candidate subreddits by full-text search (ts_rank over search_tsv).
+    query_tsquery must be a valid tsquery string (e.g. from plainto_tsquery); use '' to skip FTS.
+    """
+    if not (query_tsquery and query_tsquery.strip()):
+        return []
+    sql = """
+        SELECT
+            s.id,
+            s.name,
+            s.public_description,
+            s.subscribers,
+            s.submission_type,
+            s.allow_images,
+            s.allow_videos,
+            s.allow_polls,
+            s.topics,
+            v.beginner,
+            v.seriousness,
+            v.summary AS vibe_summary,
+            ts_rank_cd(e.search_tsv, plainto_tsquery('english', %(qt)s)) AS fts_rank
+        FROM embedding e
+        JOIN subreddit s ON s.id = e.subreddit_id
+        LEFT JOIN vibe v ON v.subreddit_id = s.id
+        WHERE e.search_tsv IS NOT NULL AND e.search_tsv @@ plainto_tsquery('english', %(qt)s)
+        ORDER BY fts_rank DESC, s.name ASC
+        LIMIT %(lim)s
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"qt": query_tsquery, "lim": limit})
+            return cur.fetchall()
+    except Exception as ex:
+        logger.error("Postgres FTS query failed: %s", ex)
+        return []
 
-    NOTE: Explicitly cast the param to ::vector to avoid 'operator does not exist: vector <=> <type>' errors.
+
+def _query_semantic_candidates(
+    conn: psycopg.Connection, query_vec: List[float], limit: int
+) -> List[Dict[str, Any]]:
+    """
+    Get candidate subreddits by vector similarity (cosine).
+    similarity = 1 - distance.
     """
     sql = """
         SELECT
@@ -310,6 +356,7 @@ def _query_similar_subreddits(conn: psycopg.Connection, query_vec: List[float], 
             s.allow_images,
             s.allow_videos,
             s.allow_polls,
+            s.topics,
             v.beginner,
             v.seriousness,
             v.summary AS vibe_summary,
@@ -327,6 +374,71 @@ def _query_similar_subreddits(conn: psycopg.Connection, query_vec: List[float], 
     except Exception as ex:
         logger.error("Postgres similarity query failed: %s", ex)
         raise
+
+
+def _query_hybrid(
+    conn: psycopg.Connection,
+    query_text: str,
+    query_vec: List[float],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """
+    Hybrid retrieval: combine lexical (FTS ts_rank) and semantic (pgvector) scores
+    with configurable weights. Downweight subreddit name by using combined search_tsv
+    (description + rules + wiki + flair). Returns top `limit` rows with deterministic
+    ordering (combined score DESC, then s.name ASC).
+    """
+    k = min(limit * 3, HYBRID_CANDIDATES_PER_BRANCH)
+    # Sanitize query for plainto_tsquery: use first 500 chars, strip
+    q_clean = (query_text or "")[:500].strip().replace("'", " ")
+    lexical_rows = _query_lexical_candidates(conn, q_clean, k) if q_clean else []
+    semantic_rows = _query_semantic_candidates(conn, query_vec, k)
+
+    # Key by subreddit id; keep one row with merged scores
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for r in semantic_rows:
+        sid = r["id"]
+        by_id[sid] = dict(r)
+        by_id[sid]["semantic_score"] = float(r.get("similarity") or 0)
+        by_id[sid]["lexical_rank"] = None
+
+    fts_max = 0.0
+    for r in lexical_rows:
+        sid = r["id"]
+        rank = float(r.get("fts_rank") or 0)
+        if rank > fts_max:
+            fts_max = rank
+        if sid not in by_id:
+            by_id[sid] = dict(r)
+            by_id[sid]["semantic_score"] = 0.0
+            by_id[sid]["lexical_rank"] = rank
+        else:
+            by_id[sid]["lexical_rank"] = rank
+
+    # Normalize FTS to [0, 1] and compute combined score
+    for sid, row in by_id.items():
+        lr = row.get("lexical_rank")
+        ls = (lr / fts_max) if (fts_max and lr is not None) else 0.0
+        ss = row.get("semantic_score", 0.0)
+        row["similarity"] = HYBRID_LEXICAL_WEIGHT * ls + HYBRID_SEMANTIC_WEIGHT * ss
+        row["fts_norm"] = ls
+        row["sem_norm"] = ss
+
+    # Deterministic sort: combined score DESC, then name ASC
+    ordered = sorted(
+        by_id.values(),
+        key=lambda x: (-(x["similarity"] or 0), (x.get("name") or "").lower()),
+    )
+    return ordered[:limit]
+
+
+def _query_similar_subreddits(conn: psycopg.Connection, query_vec: List[float], limit: int) -> List[Dict[str, Any]]:
+    """
+    Get candidate subreddits by hybrid retrieval (lexical + semantic).
+    Kept for backwards compatibility; delegates to _query_hybrid with empty query text
+    when only vector is available (caller should pass query_text for full hybrid).
+    """
+    return _query_hybrid(conn, "", query_vec, limit)
 
 def _fetch_rules_for_subs(conn: psycopg.Connection, sub_ids: List[str], per_sub_cap: int) -> Dict[str, List[Dict[str, Any]]]:
     if not sub_ids:
@@ -557,9 +669,14 @@ async def analyze_post(
         logger.error("Embedding error: %s", e)
         raise HTTPException(status_code=500, detail="Embedding error. Check OPENAI_API_KEY and EMBED_MODEL.")
 
-    # 4) Fetch candidate subreddits by vector similarity (pgvector)
+    # 4) Fetch candidate subreddits by hybrid retrieval (FTS + pgvector)
     try:
-        candidates = _query_similar_subreddits(_db_conn, post_embedding, MAX_CANDIDATE_SUBS)
+        candidates = _query_hybrid(
+            _db_conn,
+            query_text=query_text,
+            query_vec=post_embedding,
+            limit=MAX_CANDIDATE_SUBS,
+        )
     except Exception as e:
         # This is where dimension mismatches or operator issues show up
         msg = (
@@ -595,6 +712,9 @@ async def analyze_post(
         rules_list = [(r.get("description") or "").strip() for r in rules if (r.get("description") or "").strip()]
         ai_warning = rule_violations.get(sid, [])
 
+        topics_raw = row.get("topics")
+        topics_list = list(topics_raw) if topics_raw else []
+
         match = SubredditMatch(
             subreddit=row["name"],
             score=float(row["similarity"]),
@@ -606,6 +726,7 @@ async def analyze_post(
             seriousness_score=int(row["seriousness"]) if row.get("seriousness") is not None else None,
             content_types_not_allowed=_content_types_not_allowed(row),
             summary=(row.get("vibe_summary") or None),
+            topics=topics_list,
         )
         matches.append(match)
 

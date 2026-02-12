@@ -24,6 +24,7 @@ Canonical row per subreddit. Primary key is the Reddit fullname `t5_xxx`.
 | `created_utc`           | TIMESTAMPTZ  | Sub creation time |
 | `last_crawled_at`       | TIMESTAMPTZ  | Ingestion timestamp |
 | `rules_hash`            | TEXT         | SHA-256 of concatenated rule descriptions |
+| `topics`                | TEXT[]       | Topic tags (rule-based + optional LLM taxonomy) |
 
 ---
 
@@ -72,13 +73,17 @@ Heuristic + LLM characterization of posting vibe; one row per subreddit.
 
 ---
 
-### `embedding` (pgvector)
-Single vector per subreddit for similarity search.
+### `embedding` (pgvector + FTS)
+Single vector per subreddit plus combined text for hybrid search (lexical + semantic).
 
 | Column                   | Type               | Notes |
 |--------------------------|--------------------|------|
 | `subreddit_id` (PK, FK)  | TEXT               | → `subreddit(id)` ON DELETE CASCADE |
-| `embedding`              | `vector(EMBED_DIM)`| `EMBED_DIM` from env (default 1536) |
+| `embedding`              | `vector(EMBED_DIM)`| `EMBED_DIM` from env (default 1536); from combined text |
 | `input_hash`             | TEXT               | SHA-256 of composite input text |
 | `model_name`             | TEXT               | Embedding model id (e.g., `text-embedding-3-small`) |
 | `updated_at`             | TIMESTAMPTZ        | Last write |
+| `search_text`            | TEXT               | Combined text: description + rules + wiki + flair (source for embedding and FTS) |
+| `search_tsv`             | TSVECTOR           | FTS index over `search_text` for lexical search |
+
+**Indexes:** HNSW or IVFFlat on `embedding` (cosine); GIN on `search_tsv`.

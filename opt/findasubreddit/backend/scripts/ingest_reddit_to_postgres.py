@@ -145,12 +145,12 @@ INSERT INTO subreddit (
   id, id36, name, title, public_description, description_md, description_hash,
   over18, quarantined, subreddit_type, submission_type,
   allow_images, allow_videos, allow_polls, suggested_comment_sort,
-  subscribers, created_utc, last_crawled_at, rules_hash
+  subscribers, created_utc, last_crawled_at, rules_hash, topics
 ) VALUES (
   %(id)s, %(id36)s, %(name)s, %(title)s, %(public_description)s, %(description_md)s, %(description_hash)s,
   %(over18)s, %(quarantined)s, %(subreddit_type)s, %(submission_type)s,
   %(allow_images)s, %(allow_videos)s, %(allow_polls)s, %(suggested_comment_sort)s,
-  %(subscribers)s, %(created_utc)s, %(last_crawled_at)s, %(rules_hash)s
+  %(subscribers)s, %(created_utc)s, %(last_crawled_at)s, %(rules_hash)s, %(topics)s
 )
 ON CONFLICT (id) DO UPDATE SET
   title=EXCLUDED.title,
@@ -168,7 +168,8 @@ ON CONFLICT (id) DO UPDATE SET
   subscribers=EXCLUDED.subscribers,
   created_utc=EXCLUDED.created_utc,
   last_crawled_at=EXCLUDED.last_crawled_at,
-  rules_hash=EXCLUDED.rules_hash;
+  rules_hash=EXCLUDED.rules_hash,
+  topics=EXCLUDED.topics;
 """
 
 DELETE_RULES = "DELETE FROM rules WHERE subreddit_id=%s;"
@@ -183,13 +184,15 @@ ON CONFLICT (subreddit_id, flair_id) DO UPDATE SET
 """
 
 UPSERT_EMBED = """
-INSERT INTO embedding (subreddit_id, embedding, input_hash, model_name, updated_at)
-VALUES (%s, %s::vector, %s, %s, %s)
+INSERT INTO embedding (subreddit_id, embedding, input_hash, model_name, updated_at, search_text, search_tsv)
+VALUES (%s, %s::vector, %s, %s, %s, %s, to_tsvector('english', coalesce(%s, '')))
 ON CONFLICT (subreddit_id) DO UPDATE SET
   embedding=EXCLUDED.embedding,
   input_hash=EXCLUDED.input_hash,
   model_name=EXCLUDED.model_name,
-  updated_at=EXCLUDED.updated_at;
+  updated_at=EXCLUDED.updated_at,
+  search_text=EXCLUDED.search_text,
+  search_tsv=EXCLUDED.search_tsv;
 """
 
 UPSERT_VIBE = """
@@ -285,12 +288,117 @@ def safe_user_link_flairs(sub) -> List[Dict[str, Any]]:
         pass
     return flairs
 
-def build_composite_text(name: str, public_desc: str, submit_text: str, rules_text: str) -> str:
+# -------- Topic taxonomy (rule-based + optional LLM) --------
+# Small taxonomy for topic tags; rule-based matchers map keywords -> tags.
+TOPIC_TAXONOMY: List[str] = [
+    "technology", "gaming", "science", "programming", "art", "music", "movies", "books",
+    "fitness", "cooking", "travel", "photography", "finance", "career", "education",
+    "support", "advice", "discussion", "news", "humor", "creative", "sports",
+    "diy", "pets", "parenting", "relationships", "mental health", "legal",
+]
+
+# Keywords (lowercase) -> topic tag; first match wins per topic.
+TOPIC_KEYWORDS: Dict[str, List[str]] = {
+    "technology": ["tech", "software", "hardware", "computer", "phone", "app", "digital"],
+    "gaming": ["game", "gaming", "playstation", "xbox", "nintendo", "pc gaming", "esports"],
+    "science": ["science", "physics", "biology", "chemistry", "research", "space", "astronomy"],
+    "programming": ["programming", "coding", "developer", "python", "javascript", "software dev"],
+    "art": ["art", "drawing", "painting", "digital art", "illustration"],
+    "music": ["music", "guitar", "piano", "band", "album", "song"],
+    "movies": ["movie", "film", "cinema", "tv show", "netflix"],
+    "books": ["book", "reading", "novel", "literature"],
+    "fitness": ["fitness", "workout", "gym", "running", "weight", "exercise"],
+    "cooking": ["cooking", "recipe", "food", "baking", "kitchen"],
+    "travel": ["travel", "vacation", "trip", "destination"],
+    "photography": ["photography", "photo", "camera", "lens"],
+    "finance": ["finance", "investing", "money", "stock", "budget", "frugal"],
+    "career": ["career", "job", "employment", "resume", "interview"],
+    "education": ["education", "learn", "study", "student", "school", "university"],
+    "support": ["support", "help", "advice", "venting", "mental health"],
+    "advice": ["advice", "recommendation", "suggest", "should i"],
+    "discussion": ["discussion", "discuss", "opinion", "thoughts", "ask"],
+    "news": ["news", "current events", "politics", "world"],
+    "humor": ["humor", "meme", "funny", "joke", "comedy"],
+    "creative": ["creative", "writing", "oc", "original content", "show and tell"],
+    "sports": ["sports", "football", "basketball", "soccer", "nfl", "nba"],
+    "diy": ["diy", "build", "project", "craft", "woodworking"],
+    "pets": ["pet", "dog", "cat", "animal"],
+    "parenting": ["parent", "parenting", "kids", "child"],
+    "relationships": ["relationship", "dating", "marriage", "family"],
+    "mental health": ["mental health", "anxiety", "depression", "therapy"],
+    "legal": ["legal", "law", "lawyer", "rights"],
+}
+
+
+def compute_topics_rule_based(
+    name: str,
+    public_desc: str,
+    rules_text: str,
+    flair_texts: List[str],
+) -> List[str]:
+    """Rule-based topic extraction from name, description, rules, and flair. Returns deduplicated list of tags."""
+    combined = f"{name} {public_desc} {rules_text} {' '.join(flair_texts)}".lower()
+    found: Set[str] = set()
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if topic not in found and any(kw in combined for kw in keywords):
+            found.add(topic)
+    return sorted(found) if found else ["discussion"]  # default
+
+
+def enrich_topics_llm(
+    name: str,
+    public_desc: str,
+    rules_snippet: str,
+    existing_topics: List[str],
+    model: str = SUMMARY_MODEL,
+) -> List[str]:
+    """Optional LLM hook: suggest additional topic tags from taxonomy. Merges with existing (no duplicates)."""
+    if not existing_topics:
+        existing_topics = ["discussion"]
+    taxonomy_str = ", ".join(TOPIC_TAXONOMY)
+    prompt = (
+        f"From this subreddit info, pick 1-4 topic tags from this list (comma-separated): {taxonomy_str}\n"
+        f"Subreddit: r/{name}\n"
+        f"Description: {public_desc[:500]}\n"
+        f"Rules snippet: {rules_snippet[:500]}\n"
+        f"Already assigned: {', '.join(existing_topics)}\n"
+        "Return only the comma-separated tags, no other text. Use lowercase."
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = (resp.choices[0].message.content or "").strip().lower()
+        added = [t.strip() for t in raw.split(",") if t.strip() and t.strip() in TOPIC_TAXONOMY]
+        merged = list(dict.fromkeys(existing_topics + added))
+        return merged[:10]  # cap total
+    except Exception:
+        return existing_topics
+
+
+# Set to True to use LLM to enrich topics (slower, uses API).
+USE_LLM_TOPICS = os.getenv("USE_LLM_TOPICS", "false").lower() in ("1", "true", "yes")
+
+
+def build_composite_text(
+    name: str,
+    public_desc: str,
+    submit_text: str,
+    rules_text: str,
+    wiki_text: str = "",
+    flair_text: str = "",
+) -> str:
+    """Combined text for embedding and FTS: description + rules + wiki + flair. Name included for context (downweighted at query time)."""
     return (
         f"Subreddit: {name}\n"
         f"Description: {public_desc}\n"
         f"Submit Rules: {submit_text}\n"
-        f"Rules: {rules_text}"
+        f"Rules: {rules_text}\n"
+        f"Wiki: {wiki_text}\n"
+        f"Flair: {flair_text}"
     )
 
 def _soft_clip_at_boundary(s: str, max_chars: int) -> str:
@@ -480,6 +588,21 @@ def fetch_submit_text(sr) -> str:
     except Exception:
         return ""
 
+
+def fetch_wiki_text(sr) -> str:
+    """Fetch wiki index page content if available (no mod perms required). Safe to call; returns '' on failure."""
+    try:
+        wiki = sr.wiki
+        page = wiki.get("index", None) or wiki.get("sidebar", None)
+        if page is not None:
+            return (getattr(page, "content_md", None) or "")[:8000]
+    except (Forbidden, NotFound, PrawcoreException, KeyError):
+        pass
+    except Exception:
+        pass
+    return ""
+
+
 # --- LLM summary (JSON-mode with fallback) ---
 
 def generate_llm_summary_and_restrictions(
@@ -619,6 +742,16 @@ def summarize_vibe_fallback(v: Dict[str, int], content_type: str) -> str:
 
 # -------- DB ops & validation --------
 
+def ensure_migration_001_columns(conn: psycopg.Connection):
+    """Idempotent: add topics, search_text, search_tsv and GIN index if not present (mirrors 001_topics_and_fts.sql)."""
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE subreddit ADD COLUMN IF NOT EXISTS topics TEXT[];")
+        cur.execute("ALTER TABLE embedding ADD COLUMN IF NOT EXISTS search_text TEXT;")
+        cur.execute("ALTER TABLE embedding ADD COLUMN IF NOT EXISTS search_tsv TSVECTOR;")
+        cur.execute("CREATE INDEX IF NOT EXISTS embedding_search_tsv_gin ON embedding USING GIN (search_tsv);")
+    conn.commit()
+
+
 def create_schema(conn: psycopg.Connection):
     # Create tables / extension
     try:
@@ -628,6 +761,8 @@ def create_schema(conn: psycopg.Connection):
     except Exception as e:
         raise RuntimeError("Failed to create schema or enable pgvector. "
                            "Ensure the 'vector' extension is installed and you have sufficient privileges.") from e
+
+    ensure_migration_001_columns(conn)
 
     # Try HNSW, fall back to IVFFlat (B: simpler IVFFlat creation)
     try:
@@ -723,12 +858,19 @@ def upsert_subreddit(conn: psycopg.Connection, sub, rules_list: List[Dict[str, s
     desc_md = getattr(sub, "description", None) or ""
     desc_hash = sha256_str(desc_md) if desc_md else None
 
-    # composite for embeddings & summary (raw, un-clipped)
+    # Wiki (optional)
+    wiki_text = fetch_wiki_text(sub)
+    flair_texts = [f["text"] for f in flairs if f.get("text")]
+    flair_joined = " ".join(flair_texts)
+
+    # Combined text for embedding and FTS: description + rules + wiki + flair
     composite_text = build_composite_text(
         sub.display_name,
         sub.public_description or "",
         submit_text or "",
-        rules_for_embed
+        rules_for_embed,
+        wiki_text=wiki_text,
+        flair_text=flair_joined,
     )
 
     # Pre-embed clipping to avoid model token limits (A)
@@ -740,8 +882,22 @@ def upsert_subreddit(conn: psycopg.Connection, sub, rules_list: List[Dict[str, s
     # Hash the ACTUAL text we embed to keep "input changed?" checks consistent
     input_hash = sha256_str(composite_text_for_embed)
 
-    # flair texts
-    flair_texts = [f["text"] for f in flairs if f.get("text")]
+    # Topic tags: rule-based + optional LLM
+    topics_rule = compute_topics_rule_based(
+        sub.display_name,
+        sub.public_description or "",
+        rules_joined,
+        flair_texts,
+    )
+    if USE_LLM_TOPICS:
+        topics_list = enrich_topics_llm(
+            sub.display_name,
+            sub.public_description or "",
+            rules_joined[:1500],
+            topics_rule,
+        )
+    else:
+        topics_list = topics_rule
 
     # content type heuristic
     content_type = compute_content_type(
@@ -754,7 +910,7 @@ def upsert_subreddit(conn: psycopg.Connection, sub, rules_list: List[Dict[str, s
 
     vibe_scores = compute_vibe_heuristics(rules_joined, f"{sub.public_description}\n{desc_md}", flair_texts)
 
-    # Upsert subreddit row first
+    # Upsert subreddit row first (including topics)
     data = {
         "id": getattr(sub, "fullname", None) or f"t5_{sub.id}",
         "id36": sub.id,
@@ -774,7 +930,8 @@ def upsert_subreddit(conn: psycopg.Connection, sub, rules_list: List[Dict[str, s
         "subscribers": getattr(sub, "subscribers", None),
         "created_utc": datetime.fromtimestamp(getattr(sub, "created_utc", 0), tz=timezone.utc) if getattr(sub, "created_utc", None) else None,
         "last_crawled_at": now,
-        "rules_hash": rules_hash
+        "rules_hash": rules_hash,
+        "topics": topics_list,
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_SUBREDDIT, data)
@@ -816,7 +973,9 @@ def upsert_subreddit(conn: psycopg.Connection, sub, rules_list: List[Dict[str, s
                     vec_to_pg(emb),
                     input_hash,
                     EMBED_MODEL,
-                    now
+                    now,
+                    composite_text_for_embed,
+                    composite_text_for_embed,  # used again for to_tsvector in SQL
                 ))
         except Exception as e:
             print(f"[embed] {data['name']}: {e}")

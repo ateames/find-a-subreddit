@@ -108,6 +108,92 @@ python scripts/ingest_reddit_to_postgres.py
 
 ---
 
+## Topic tags and hybrid search
+
+- **Topic tags**: Each subreddit gets a `topics` array (rule-based + optional LLM). Set `USE_LLM_TOPICS=true` to enrich with LLM.
+- **Hybrid retrieval**: Search combines **lexical** (Postgres FTS on `embedding.search_tsv`) and **semantic** (pgvector on `embedding.embedding`). Combined text indexed is description + rules + wiki + flair (subreddit name is in the text but can be downweighted via config).
+
+### Tuning hybrid weights
+
+Weights are env vars; they should sum to 1:
+
+- `HYBRID_LEXICAL_WEIGHT` (default `0.35`) – weight for FTS score
+- `HYBRID_SEMANTIC_WEIGHT` (default `0.65`) – weight for vector similarity
+
+Example: more keyword-heavy search (exact phrases matter):
+
+```bash
+export HYBRID_LEXICAL_WEIGHT=0.5
+export HYBRID_SEMANTIC_WEIGHT=0.5
+```
+
+More semantic (meaning over exact words):
+
+```bash
+export HYBRID_LEXICAL_WEIGHT=0.25
+export HYBRID_SEMANTIC_WEIGHT=0.75
+```
+
+### Example SQL for hybrid ranking
+
+You can run a hybrid-style query directly in SQL (e.g. in `psql`) like this:
+
+```sql
+-- Replace :query_text and :query_vec (as string) with your values
+WITH q AS (
+  SELECT plainto_tsquery('english', 'python programming help') AS fts_q
+),
+lex AS (
+  SELECT e.subreddit_id,
+         ts_rank_cd(e.search_tsv, (SELECT fts_q FROM q)) AS score
+  FROM embedding e, q
+  WHERE e.search_tsv IS NOT NULL AND e.search_tsv @@ (SELECT fts_q FROM q)
+  ORDER BY score DESC
+  LIMIT 100
+),
+sem AS (
+  SELECT e.subreddit_id,
+         1 - (e.embedding <=> '[0.1, -0.02, ...]'::vector) AS score
+  FROM embedding e
+  ORDER BY e.embedding <=> '[0.1, -0.02, ...]'::vector
+  LIMIT 100
+)
+SELECT s.name,
+       0.35 * COALESCE(l.score / NULLIF((SELECT max(score) FROM lex), 0), 0) +
+       0.65 * COALESCE(ss.score, 0) AS combined
+FROM subreddit s
+LEFT JOIN lex l ON l.subreddit_id = s.id
+LEFT JOIN sem ss ON ss.subreddit_id = s.id
+WHERE l.subreddit_id IS NOT NULL OR ss.subreddit_id IS NOT NULL
+ORDER BY combined DESC NULLS LAST, s.name
+LIMIT 20;
+```
+
+The API does the same merge in Python (normalize FTS by max rank, then `lex_weight * fts_norm + sem_weight * vec_sim`) with deterministic tie-break by `s.name`.
+
+---
+
+## Migrations and backfill
+
+After adding topic tags and FTS columns:
+
+1. **Run migration** (adds `subreddit.topics`, `embedding.search_text`, `embedding.search_tsv`, GIN index):
+
+   ```bash
+   psql "$DATABASE_URL" -f opt/findasubreddit/backend/scripts/migrations/001_topics_and_fts.sql
+   ```
+
+2. **Backfill existing rows** (from backend directory):
+
+   ```bash
+   cd opt/findasubreddit/backend
+   python scripts/backfill_topics_and_fts.py [--dry-run] [--reembed]
+   ```
+
+See `opt/findasubreddit/backend/scripts/migrations/README.md` for full commands (local and production).
+
+---
+
 ## License
 
 This project is licensed under the MIT License.
