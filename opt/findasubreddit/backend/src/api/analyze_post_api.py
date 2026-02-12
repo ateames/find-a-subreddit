@@ -56,6 +56,9 @@ MAX_RULES_PER_SUB_FOR_CHECK = int(os.getenv("MAX_RULES_PER_SUB_FOR_CHECK", "20")
 MAX_WARNINGS_PER_SUB = int(os.getenv("MAX_WARNINGS_PER_SUB", "5"))
 MAX_TOTAL_RULES_TO_EMBED = int(os.getenv("MAX_TOTAL_RULES_TO_EMBED", "300"))  # upper bound per request
 
+# Rerank: after hybrid + topic filter, take this many candidates and rerank with constraints
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "50"))
+
 # CORS
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")
 
@@ -297,6 +300,119 @@ def summarize_post_for_preview(title: str, body: str, context: Optional[str]) ->
     except Exception as ex:
         logger.warning("AI summary failed: %s", ex)
         return ""
+
+# ---------------------- SEARCH SPEC & POSITIVE-ONLY EMBED ----------------------
+def _parse_list_param(value: Optional[str]) -> List[str]:
+    """Parse comma/whitespace-separated string to list of non-empty, stripped, lowercased strings."""
+    if not value or not value.strip():
+        return []
+    return [p.strip().lower() for p in re.split(r"[, \t]+", value) if p.strip()]
+
+
+def build_embed_text_positive_only(
+    title: str,
+    body: str,
+    context: str,
+    link: Optional[str],
+    include_terms: List[str],
+    exclude_terms: List[str],
+    exclude_topics: List[str],
+) -> str:
+    """
+    Build the ONLY text that may be sent to the embedding model.
+    Uses only positive signals: title, body, context, link, include_terms.
+    exclude_terms and exclude_topics must NOT appear in the returned string
+    (stripped case-insensitively so embedding never sees negative intent).
+    """
+    parts = [title.strip(), body.strip()]
+    if context:
+        parts.append(f"Context: {context.strip()}")
+    if link and link.strip():
+        parts.append(f"Link: {link.strip()}")
+    text = "\n\n".join(p for p in parts if p)
+    if include_terms:
+        text = (text + "\n\n" + " ".join(include_terms)).strip()
+    # Remove any occurrence of exclude terms and exclude_topics (case-insensitive)
+    to_remove = list(exclude_terms) + list(exclude_topics)
+    for term in to_remove:
+        if not term:
+            continue
+        # Remove the phrase everywhere (case-insensitive)
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        text = pattern.sub("", text)
+    # Collapse repeated whitespace and trim
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _apply_topic_filter(
+    candidates: List[Dict[str, Any]],
+    must_topics: List[str],
+    exclude_topics: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Hard topic filter BEFORE combining scores / top N.
+    - must_topics: AND/overlap — keep only if subreddit.topics overlaps must_topics (or must_topics is empty).
+    - exclude_topics: NOT — keep only if subreddit.topics has no overlap with exclude_topics.
+    """
+    if not must_topics and not exclude_topics:
+        return candidates
+    must_set = set(t.lower() for t in must_topics)
+    exclude_set = set(t.lower() for t in exclude_topics)
+    out: List[Dict[str, Any]] = []
+    for row in candidates:
+        sub_topics = row.get("topics") or []
+        sub_set = set((t or "").lower() for t in sub_topics)
+        if must_set and not (sub_set & must_set):
+            continue
+        if exclude_set and (sub_set & exclude_set):
+            continue
+        out.append(row)
+    return out
+
+
+def _rerank_with_constraints(
+    candidates: List[Dict[str, Any]],
+    must_topics: List[str],
+    exclude_topics: List[str],
+    include_terms: List[str],
+    exclude_terms: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Rerank top-N candidates (already topic-filtered) with constraint-aware scoring.
+    Does not add/remove items; only reorders. Filtered-out items cannot be resurrected.
+    """
+    if not candidates:
+        return []
+    must_set = set(t.lower() for t in must_topics)
+    exclude_set = set(t.lower() for t in exclude_topics)
+    include_set = set(t.lower() for t in include_terms)
+    exclude_terms_set = set(t.lower() for t in exclude_terms)
+
+    def score(row: Dict[str, Any]) -> Tuple[float, str]:
+        base = float(row.get("similarity") or 0)
+        sub_topics = set((t or "").lower() for t in (row.get("topics") or []))
+        name = (row.get("name") or "").lower()
+        desc = (row.get("public_description") or "").lower()
+        # Boost for must_topics overlap (meaningful so one match can overcome small score gaps)
+        if must_set:
+            base += 0.15 * len(sub_topics & must_set)
+        # Penalty for exclude_topics (should be 0 after filter; defensive)
+        base -= 0.2 * len(sub_topics & exclude_set)
+        # Small boost for include term in name/desc
+        for w in include_set:
+            if w in name or w in desc:
+                base += 0.02
+                break
+        # Penalty for exclude term in name/desc
+        for w in exclude_terms_set:
+            if w in name or w in desc:
+                base -= 0.1
+                break
+        return (base, name)
+
+    return sorted(candidates, key=lambda row: (-score(row)[0], (row.get("name") or "").lower()))
+
 
 # ---------------------- DB HELPERS ----------------------
 def _query_lexical_candidates(
@@ -636,49 +752,62 @@ async def analyze_post(
     limit: Optional[int] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     link: Optional[str] = Form(None),  # accept link from UI (optional)
+    must_topics: Optional[str] = Form(None),   # comma-separated; AND/overlap
+    exclude_topics: Optional[str] = Form(None),  # comma-separated; hard NOT
+    include: Optional[str] = Form(None),   # comma-separated positive terms
+    exclude: Optional[str] = Form(None),  # comma-separated; must NOT appear in embed text
 ):
     """
     Analyze a drafted Reddit post and return similar subreddits using Postgres (pgvector),
     plus rule-violation hints, vibe scores, and content-type constraints.
+    Pipeline: Parse SearchSpec → build embedText (positive-only) → retrieve → hard topic filter → top 50 → rerank → top N.
     """
     if _db_conn is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
 
+    # Parse search constraints (optional; backward compatible)
+    must_topics_list = _parse_list_param(must_topics)
+    exclude_topics_list = _parse_list_param(exclude_topics)
+    include_terms = _parse_list_param(include)
+    exclude_terms = _parse_list_param(exclude)
+
     # 1) Optional: AI captions for any uploaded images
     ai_image_captions = await caption_images(files)
 
-    # 2) Build query text
+    # 2) Build context (with captions) and POSITIVE-ONLY embed text (exclude/exclude_topics must NOT be embedded)
     enhanced_context = (context or "").strip()
     if ai_image_captions:
         enhanced_context = (enhanced_context + "\n\n" + "\n\n".join(ai_image_captions)).strip()
 
-    parts = [title.strip(), body.strip()]
-    if enhanced_context:
-        parts.append(f"Context: {enhanced_context}")
-    if link and link.strip():
-        parts.append(f"Link: {link.strip()}")
-    query_text = "\n\n".join([p for p in parts if p])
+    embed_text = build_embed_text_positive_only(
+        title=title.strip(),
+        body=body.strip(),
+        context=enhanced_context,
+        link=link.strip() if link else None,
+        include_terms=include_terms,
+        exclude_terms=exclude_terms,
+        exclude_topics=exclude_topics_list,
+    )
 
-    if not query_text.strip():
+    if not embed_text.strip():
         raise HTTPException(status_code=400, detail="Please provide a title, body, image, link, or context.")
 
-    # 3) Embedding for the post
+    # 3) Embedding ONLY from positive-only text (never embed exclude terms or exclude_topics)
     try:
-        post_embedding = get_embedding(query_text)
+        post_embedding = get_embedding(embed_text)
     except Exception as e:
         logger.error("Embedding error: %s", e)
         raise HTTPException(status_code=500, detail="Embedding error. Check OPENAI_API_KEY and EMBED_MODEL.")
 
-    # 4) Fetch candidate subreddits by hybrid retrieval (FTS + pgvector)
+    # 4) Hybrid retrieval (FTS + pgvector) using same positive-only text for lexical
     try:
         candidates = _query_hybrid(
             _db_conn,
-            query_text=query_text,
+            query_text=embed_text,
             query_vec=post_embedding,
             limit=MAX_CANDIDATE_SUBS,
         )
     except Exception as e:
-        # This is where dimension mismatches or operator issues show up
         msg = (
             "Postgres vector search failed. "
             "Likely causes: pgvector not installed, parameter not cast (::vector), or dimension mismatch. "
@@ -689,8 +818,18 @@ async def analyze_post(
     if not candidates:
         return AnalyzePostResponse(results=[], has_more=False, image_captions=ai_image_captions, ai_summary="")
 
-    # 5) Fetch rules for these candidates (cap per subreddit)
-    sub_ids = [row["id"] for row in candidates]
+    # 5) Hard topic filter BEFORE combining scores / top N (must_topics overlap, exclude_topics NOT)
+    filtered = _apply_topic_filter(candidates, must_topics_list, exclude_topics_list)
+
+    # 6) Top 50 then rerank with constraints (rerank cannot resurrect filtered-out items)
+    top50 = filtered[:RERANK_TOP_N]
+    reranked = _rerank_with_constraints(
+        top50, must_topics_list, exclude_topics_list, include_terms, exclude_terms
+    )
+    all_results = reranked + filtered[RERANK_TOP_N:]
+
+    # 7) Fetch rules for these candidates (cap per subreddit)
+    sub_ids = [row["id"] for row in all_results]
     try:
         rules_by_sub = _fetch_rules_for_subs(_db_conn, sub_ids, MAX_RULES_PER_SUB_FOR_CHECK)
     except Exception:
@@ -704,9 +843,9 @@ async def analyze_post(
         max_warnings_per_sub=MAX_WARNINGS_PER_SUB,
     )
 
-    # 7) Build match objects
+    # 8) Build match objects from final ordered list (reranked top 50 + rest)
     matches: List[SubredditMatch] = []
-    for row in candidates:
+    for row in all_results:
         sid = row["id"]
         rules = rules_by_sub.get(sid, [])
         rules_list = [(r.get("description") or "").strip() for r in rules if (r.get("description") or "").strip()]
@@ -730,9 +869,7 @@ async def analyze_post(
         )
         matches.append(match)
 
-    # 8) Sort and paginate
-    matches.sort(key=lambda m: (m.score, m.subscribers), reverse=True)
-
+    # 10) Paginate (order already fixed: reranked top 50 then filtered tail)
     page = max(1, page)
     page_size = limit if (isinstance(limit, int) and limit > 0) else PAGE_SIZE_DEFAULT
     start = (page - 1) * page_size
@@ -740,7 +877,7 @@ async def analyze_post(
     paginated_matches = matches[start:end]
     has_more = len(matches) > end
 
-    # 9) AI summary of the user's post (short, 1 sentence)
+    # 11) AI summary of the user's post (short, 1 sentence)
     ai_summary = summarize_post_for_preview(title, body, enhanced_context)
 
     return AnalyzePostResponse(
