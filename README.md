@@ -29,6 +29,8 @@ Before starting, ensure you have the following installed:
 
 ## Running the Project
 
+**For step-by-step local setup and testing**, see **[docs/LOCAL_TESTING.md](docs/LOCAL_TESTING.md)**.
+
 ### 1 Use Docker to create the database and ingest subreddits 
 Build images (only needed after changing Dockerfile/requirements)
 ```
