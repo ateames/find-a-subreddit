@@ -23,7 +23,7 @@ Before starting, ensure you have the following installed:
 - Python 3.8+
 - Node.js 16+
 - npm or yarn
-- A `.env` file with the required API keys (see `sample.env` for reference).
+- Edit `sample.env` file and `opt/findasubreddit/deploy/sample.backend.env` with the required keys and values. TO-DO: 
 
 ---
 
